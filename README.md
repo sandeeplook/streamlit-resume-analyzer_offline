@@ -15,21 +15,35 @@ Because there's no AI model involved, this is a **keyword/pattern-matching**
 tool, not a reasoning engine. Be aware of the trade-off:
 
 **It can:**
-- Extract skills from a curated list (`services/skills_data.py`)
-- Estimate years of experience from date ranges in the resume
+- Detect resume section headers (Skills / Experience / Education /
+  Certifications) and scope extraction to the right section
+- Match skills via exact keywords, common synonyms/abbreviations ("ML" →
+  Machine Learning, "K8s" → Kubernetes, "JS" → JavaScript, etc. — see
+  `services/skills_data.py`), and fuzzy matching for typos/spacing variants
+  found in a resume's Skills section (e.g. "Djnago" → Django)
+- Estimate years of experience from date ranges (including month-name
+  formats like "Jun 2017 - Dec 2019")
 - Pull out experience entries (title/company/duration/bullets), education,
   and certifications via pattern matching
-- Score skill/experience/education/certification overlap against the JD
-- Flag missing skills/keywords and basic red flags (overlapping employment
-  dates, missing contact info, very short resume text)
+- Split a job description into "must-have" vs "nice-to-have" requirements
+  (when the JD has those headers) and weight missing must-have skills more
+  heavily than missing nice-to-have ones in the score
+- Flag basic red flags: overlapping employment dates, missing contact info,
+  unusually short resume text
+- Extract PDF text via `pdfplumber` (falls back to `pypdf` if needed), which
+  preserves line breaks/layout better than `pypdf` alone — important since
+  the parsing above depends on line structure
 
 **It can't:**
 - Understand context or judge whether experience is genuinely relevant
 - Write a natural-language, reasoned recommendation — summaries here are
   templated sentences built from the extracted data, not AI-generated prose
 - Reliably catch subtle inconsistencies or exaggerations
-- Handle every possible resume layout or synonym for a skill — matching
-  is keyword-based, so unusual phrasing may be missed
+- Handle every resume layout — heavily designed/columnar resumes, scanned
+  images, or unusual section naming will still degrade results
+- Match a skill that isn't in `services/skills_data.py` and has no close
+  fuzzy variant of something that is — the skill/synonym list is curated,
+  not exhaustive
 
 Treat its output as a **first-pass filter**, not a final verdict.
 
@@ -92,7 +106,12 @@ Python version** to `3.11`, matching the included `runtime.txt`.
 ## Extending it
 
 - Add more terms to `services/skills_data.py` (`SKILLS`,
-  `CERTIFICATION_KEYWORDS`, `DEGREE_KEYWORDS`) to widen what gets detected.
+  `SKILL_SYNONYMS`, `CERTIFICATION_KEYWORDS`, `DEGREE_KEYWORDS`,
+  `SECTION_HEADERS`) to widen what gets detected.
 - Scoring weights and thresholds live in `services/rule_based_analyzer.py`
   (`analyze_resume()`), if you want to tune how skills/experience/education/
-  certifications combine into the overall score.
+  certifications combine into the overall score, or how much must-have vs
+  nice-to-have skills matter.
+- The fuzzy-match cutoff (`cutoff=0.84` in `_fuzzy_match_tokens_to_skills`)
+  controls how lenient typo-matching is — lower it to catch more variants
+  at the risk of more false positives.

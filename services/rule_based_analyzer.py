@@ -1,18 +1,41 @@
 """
 Rule-based resume verification & JD match analyzer.
 
-Runs entirely offline using regex/keyword pattern matching — no external API,
-no AI model, no network call. This trades reasoning depth for zero cost and
-zero dependency on any third-party service.
+Runs entirely offline using regex/keyword pattern matching plus lightweight
+fuzzy matching (stdlib difflib only) — no external API, no AI model, no
+network call. This trades reasoning depth for zero cost and zero dependency
+on any third-party service.
+
+Improvements over the basic version:
+- Section-aware parsing: resume text is split into Skills/Experience/
+  Education/Certifications blocks (when headers are detected) so extraction
+  is scoped to the right part of the document instead of scanning everything
+  as one blob.
+- Synonym/alias matching (services/skills_data.SKILL_SYNONYMS) so "ML",
+  "JS", "K8s" etc. count as their canonical skill.
+- Fuzzy matching (difflib) on tokens found in a detected Skills section, to
+  catch minor typos/spacing variants that exact matching would miss.
+- JD "must-have" vs "nice-to-have" section splitting, so missing mandatory
+  skills are weighted more heavily than missing optional ones.
 
 The output dict intentionally matches the same schema the rest of the app
 (report_export.py, app.py) expects, so no other files needed to change shape.
 """
+import difflib
 import re
 from collections import Counter
 from datetime import datetime
 
-from services.skills_data import CERTIFICATION_KEYWORDS, DEGREE_KEYWORDS, SKILLS, STOPWORDS
+from services.skills_data import (
+    CERTIFICATION_KEYWORDS,
+    DEGREE_KEYWORDS,
+    JD_MUST_HAVE_HEADERS,
+    JD_NICE_TO_HAVE_HEADERS,
+    SECTION_HEADERS,
+    SKILL_SYNONYMS,
+    SKILLS,
+    STOPWORDS,
+)
 
 CURRENT_YEAR = datetime.now().year
 
@@ -30,30 +53,134 @@ _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _PHONE_RE = re.compile(r"(\+?\d[\d\-\s()]{8,}\d)")
 _REQUIRED_YEARS_RE = re.compile(r"(\d+)\+?\s*(?:years?|yrs?)", re.IGNORECASE)
 _BULLET_RE = re.compile(r"^\s*[-•*▪‣·]\s*|^\s*\d+[.)]\s*")
+_HEADER_STRIP_RE = re.compile(r"[^a-z0-9& ]+")
 
 
+# ---------------------------------------------------------------------------
+# Section-aware parsing
+# ---------------------------------------------------------------------------
+def _normalize_header(line: str) -> str:
+    return _HEADER_STRIP_RE.sub("", line.strip().lower()).strip()
+
+
+def _split_into_sections(text: str) -> dict:
+    """
+    Scan lines for known section header phrases and return
+    {section_key: "joined body text"} for whichever sections were found.
+    Header lines themselves are excluded from the body text.
+    """
+    lines = text.splitlines()
+    header_hits = []  # (line_index, section_key)
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or len(stripped) > 45:
+            continue
+        normalized = _normalize_header(stripped)
+        if not normalized:
+            continue
+        for section_key, phrases in SECTION_HEADERS.items():
+            if normalized in phrases:
+                header_hits.append((i, section_key))
+                break
+
+    sections = {}
+    for idx, (line_no, key) in enumerate(header_hits):
+        start = line_no + 1
+        end = header_hits[idx + 1][0] if idx + 1 < len(header_hits) else len(lines)
+        body = "\n".join(lines[start:end]).strip()
+        # Later same-name headers extend rather than overwrite.
+        sections[key] = (sections.get(key, "") + "\n" + body).strip() if key in sections else body
+
+    return sections
+
+
+def _split_jd_sections(jd_text: str):
+    """Return (must_have_text, nice_to_have_text). Falls back to
+    (full_text, "") if no explicit headers are found."""
+    lines = jd_text.splitlines()
+    hits = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or len(stripped) > 60:
+            continue
+        normalized = _normalize_header(stripped)
+        if not normalized:
+            continue
+        if normalized in JD_MUST_HAVE_HEADERS:
+            hits.append((i, "must"))
+        elif normalized in JD_NICE_TO_HAVE_HEADERS:
+            hits.append((i, "nice"))
+
+    if not hits:
+        return jd_text, ""
+
+    must_parts, nice_parts = [], []
+    for idx, (line_no, kind) in enumerate(hits):
+        start = line_no + 1
+        end = hits[idx + 1][0] if idx + 1 < len(hits) else len(lines)
+        body = "\n".join(lines[start:end]).strip()
+        (must_parts if kind == "must" else nice_parts).append(body)
+
+    return "\n".join(must_parts).strip(), "\n".join(nice_parts).strip()
+
+
+# ---------------------------------------------------------------------------
+# Keyword / fuzzy matching helpers
+# ---------------------------------------------------------------------------
 def _keyword_in_text(keyword: str, text_lower: str) -> bool:
     """Word-boundary-safe substring check (avoids 'ME' matching inside 'Acme')."""
     pattern = r"(?<![a-zA-Z0-9])" + re.escape(keyword.strip().lower()) + r"(?![a-zA-Z0-9])"
     return re.search(pattern, text_lower) is not None
 
 
-def _find_skills(text: str) -> list:
-    found = []
+def _find_skills_exact(text: str) -> list:
     lower = text.lower()
-    for skill in SKILLS:
-        if _keyword_in_text(skill, lower):
-            found.append(skill)
+    return [skill for skill in SKILLS if _keyword_in_text(skill, lower)]
+
+
+def _find_skills_via_synonyms(text: str) -> list:
+    lower = text.lower()
+    found = []
+    for alias, canonical in SKILL_SYNONYMS.items():
+        if _keyword_in_text(alias, lower):
+            found.append(canonical)
+    return found
+
+
+def _fuzzy_match_tokens_to_skills(tokens: list, cutoff: float = 0.84) -> list:
+    """Catch minor typos/variants (e.g. 'Djnago', 'Postgre SQL') among tokens
+    pulled from a resume's dedicated Skills section."""
+    skills_lower = {s.lower(): s for s in SKILLS}
+    found = []
+    for token in tokens:
+        cleaned = token.strip(" .-|/").lower()
+        if len(cleaned) < 3:
+            continue
+        if cleaned in skills_lower:
+            found.append(skills_lower[cleaned])
+            continue
+        match = difflib.get_close_matches(cleaned, skills_lower.keys(), n=1, cutoff=cutoff)
+        if match:
+            found.append(skills_lower[match[0]])
+    return found
+
+
+def _find_skills(text: str, skills_section_text: str = "") -> list:
+    """Combine exact matching, synonym matching, and (when a Skills section
+    was identified) fuzzy matching, deduped and in a stable order."""
+    found = list(dict.fromkeys(_find_skills_exact(text) + _find_skills_via_synonyms(text)))
+    if skills_section_text:
+        tokens = re.split(r"[,\n•;|/]+", skills_section_text)
+        for s in _fuzzy_match_tokens_to_skills(tokens):
+            if s not in found:
+                found.append(s)
     return found
 
 
 def _find_certifications(text: str) -> list:
-    found = []
     lower = text.lower()
-    for cert in CERTIFICATION_KEYWORDS:
-        if _keyword_in_text(cert, lower):
-            found.append(cert)
-    return found
+    return [cert for cert in CERTIFICATION_KEYWORDS if _keyword_in_text(cert, lower)]
 
 
 def _find_education(text: str) -> list:
@@ -82,7 +209,6 @@ def _find_education(text: str) -> list:
                     {"degree": stripped[:100], "institution": institution, "year": year}
                 )
                 break
-    # de-duplicate near-identical entries
     seen = set()
     unique = []
     for r in results:
@@ -94,7 +220,6 @@ def _find_education(text: str) -> list:
 
 
 def _find_date_ranges(text: str):
-    """Return list of (start_year, end_year) tuples found in the text."""
     ranges = []
     for m in _DATE_RANGE_RE.finditer(text):
         start = int(m.group(1))
@@ -133,8 +258,6 @@ def _extract_experience_entries(text: str) -> list:
         date_match = _DATE_RANGE_RE.search(line)
         duration = date_match.group(0) if date_match else None
 
-        # Title line: text before the date on the same line, else previous
-        # non-empty line.
         title_part = line[: date_match.start()].strip(" -–|,") if date_match else ""
         if not title_part:
             j = i - 1
@@ -150,15 +273,11 @@ def _extract_experience_entries(text: str) -> list:
                     title, company = parts
                     break
 
-        # Highlights: lines after this one, up to the next date-line or a
-        # blank gap of 2+ lines, up to 6 bullets.
         next_boundary = date_line_indices[idx + 1] if idx + 1 < len(date_line_indices) else len(lines)
         highlights = []
         for k in range(i + 1, min(next_boundary, i + 40)):
             l = lines[k].strip()
             if not l:
-                # A blank line marks the end of this job's bullet block —
-                # stop here rather than bleeding into the next section.
                 if highlights:
                     break
                 continue
@@ -210,7 +329,6 @@ def _extract_jd_requirement_lines(jd_text: str) -> list:
     bullets = [l for l in lines if _BULLET_RE.match(l)]
     if bullets:
         return [_BULLET_RE.sub("", b).strip() for b in bullets][:25]
-    # fall back to splitting on sentences
     sentences = re.split(r"(?<=[.!?])\s+", jd_text)
     return [s.strip() for s in sentences if 15 < len(s.strip()) < 200][:25]
 
@@ -228,21 +346,43 @@ def _required_years_from_jd(jd_text: str):
     return int(match.group(1)) if match else None
 
 
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 def analyze_resume(resume_text: str, job_description: str) -> dict:
     resume_lower = resume_text.lower()
+    resume_sections = _split_into_sections(resume_text)
 
-    resume_skills = _find_skills(resume_text)
-    jd_skills = _find_skills(job_description)
-    matched_skills = [s for s in jd_skills if s in resume_skills]
-    missing_skills = [s for s in jd_skills if s not in resume_skills]
+    # Scope extraction to the right section when we can identify one;
+    # otherwise fall back to scanning the whole document (previous behavior).
+    experience_source = resume_sections.get("experience") or resume_text
+    education_source = resume_sections.get("education") or resume_text
+    certifications_source = resume_sections.get("certifications") or resume_text
+    skills_section_text = resume_sections.get("skills", "")
 
-    resume_certs = _find_certifications(resume_text)
+    resume_skills = _find_skills(resume_text, skills_section_text=skills_section_text)
+
+    # --- JD: split into must-have vs nice-to-have for weighted scoring ---
+    jd_must_text, jd_nice_text = _split_jd_sections(job_description)
+    jd_must_skills = _find_skills(jd_must_text)
+    jd_nice_skills = [s for s in _find_skills(jd_nice_text) if s not in jd_must_skills]
+    jd_skills = list(dict.fromkeys(jd_must_skills + jd_nice_skills))
+
+    matched_must = [s for s in jd_must_skills if s in resume_skills]
+    missing_must = [s for s in jd_must_skills if s not in resume_skills]
+    matched_nice = [s for s in jd_nice_skills if s in resume_skills]
+    missing_nice = [s for s in jd_nice_skills if s not in resume_skills]
+
+    matched_skills = list(dict.fromkeys(matched_must + matched_nice))
+    missing_skills = list(dict.fromkeys(missing_must + missing_nice))
+
+    resume_certs = _find_certifications(certifications_source)
     jd_certs = _find_certifications(job_description)
 
-    education = _find_education(resume_text)
-    date_ranges = _find_date_ranges(resume_text)
+    education = _find_education(education_source)
+    date_ranges = _find_date_ranges(experience_source)
     total_years = _estimate_total_years(date_ranges)
-    experience = _extract_experience_entries(resume_text)
+    experience = _extract_experience_entries(experience_source)
     contact = _extract_contact_info(resume_text)
     name, headline = _guess_name_and_headline(resume_text)
 
@@ -263,7 +403,15 @@ def analyze_resume(resume_text: str, job_description: str) -> dict:
     ][:10]
 
     # --- Scoring ---
-    skills_match = round(len(matched_skills) / len(jd_skills) * 100) if jd_skills else 60
+    if jd_must_skills or jd_nice_skills:
+        must_pct = round(len(matched_must) / len(jd_must_skills) * 100) if jd_must_skills else None
+        nice_pct = round(len(matched_nice) / len(jd_nice_skills) * 100) if jd_nice_skills else None
+        if must_pct is not None and nice_pct is not None:
+            skills_match = round(must_pct * 0.8 + nice_pct * 0.2)
+        else:
+            skills_match = must_pct if must_pct is not None else nice_pct
+    else:
+        skills_match = 60
 
     required_years = _required_years_from_jd(job_description)
     if required_years:
@@ -310,13 +458,18 @@ def analyze_resume(resume_text: str, job_description: str) -> dict:
     elif len(experience) == 0:
         formatting_quality = "No clearly delimited work-experience entries with dates were detected."
     else:
-        formatting_quality = f"Resume contains {len(experience)} identifiable experience entr{'y' if len(experience)==1 else 'ies'} and {word_count} words; structure appears parseable."
+        detected_sections = ", ".join(k for k in ["skills", "experience", "education", "certifications"] if k in resume_sections) or "none"
+        formatting_quality = (
+            f"Resume contains {len(experience)} identifiable experience entr{'y' if len(experience)==1 else 'ies'} "
+            f"and {word_count} words; detected section headers: {detected_sections}."
+        )
 
-    completeness_parts = []
-    completeness_parts.append("skills section: found" if resume_skills else "skills section: not clearly identified")
-    completeness_parts.append("experience section: found" if experience else "experience section: not clearly identified")
-    completeness_parts.append("education section: found" if education else "education section: not clearly identified")
-    completeness_parts.append("contact info: found" if (contact["email"] or contact["phone"]) else "contact info: missing")
+    completeness_parts = [
+        "skills section: found" if resume_skills else "skills section: not clearly identified",
+        "experience section: found" if experience else "experience section: not clearly identified",
+        "education section: found" if education else "education section: not clearly identified",
+        "contact info: found" if (contact["email"] or contact["phone"]) else "contact info: missing",
+    ]
     completeness_notes = "; ".join(completeness_parts) + "."
 
     authenticity_notes = (
@@ -326,7 +479,6 @@ def analyze_resume(resume_text: str, job_description: str) -> dict:
         "verification, a human reviewer or reference check is recommended."
     )
 
-    # --- Narrative-ish fields (templated, not AI-generated prose) ---
     summary = (
         f"Automated scan identified {len(resume_skills)} skill keyword(s), "
         f"{len(experience)} work-experience entr{'y' if len(experience)==1 else 'ies'}, "
@@ -335,27 +487,44 @@ def analyze_resume(resume_text: str, job_description: str) -> dict:
         f"Estimated total experience span: ~{total_years} year(s)."
     )
 
-    match_summary = (
-        f"{len(matched_skills)} of {len(jd_skills)} job-description skill keyword(s) were found "
-        f"in the resume ({skills_match}% skill keyword overlap)."
-        if jd_skills
-        else "No specific skill keywords from a known list were detected in the job description; "
-        "scoring falls back to neutral defaults for the skills dimension."
-    )
+    if jd_must_skills:
+        match_summary = (
+            f"{len(matched_must)} of {len(jd_must_skills)} must-have skill keyword(s) found "
+            f"({round(len(matched_must)/len(jd_must_skills)*100)}% coverage)"
+        )
+        if jd_nice_skills:
+            match_summary += (
+                f", plus {len(matched_nice)} of {len(jd_nice_skills)} nice-to-have skill keyword(s)."
+            )
+        else:
+            match_summary += "."
+    elif jd_skills:
+        match_summary = (
+            f"{len(matched_skills)} of {len(jd_skills)} job-description skill keyword(s) were found "
+            f"in the resume ({skills_match}% skill keyword overlap)."
+        )
+    else:
+        match_summary = (
+            "No specific skill keywords from a known list were detected in the job description; "
+            "scoring falls back to neutral defaults for the skills dimension."
+        )
 
     strengths = [f"Resume includes the '{s}' keyword, matching a JD requirement." for s in matched_skills[:8]]
     if not strengths:
         strengths = ["No direct JD skill-keyword matches were found — see missing skills below."]
 
-    weaknesses = [f"'{s}' appears in the job description but not in the resume." for s in missing_skills[:8]]
+    weaknesses = [f"'{s}' is a must-have skill in the JD but wasn't found in the resume." for s in missing_must[:6]]
+    weaknesses += [f"'{s}' is a nice-to-have skill in the JD but wasn't found in the resume." for s in missing_nice[:4]]
+    if not jd_must_text.strip() == job_description.strip() and not missing_must and not missing_nice:
+        pass  # no additional note needed
     if red_flags:
         weaknesses.extend(red_flags[:3])
     if not weaknesses:
         weaknesses = ["No notable gaps identified by the automated keyword scan."]
 
     interview_focus_areas = [
-        f"Ask the candidate to describe hands-on experience with {s}, since it's required by the "
-        f"role but wasn't detected in the resume text." for s in missing_skills[:6]
+        f"Ask the candidate to describe hands-on experience with {s}, since it's a must-have for the "
+        f"role but wasn't detected in the resume text." for s in missing_must[:6]
     ]
     if not interview_focus_areas:
         interview_focus_areas = ["Confirm depth of experience for top matched skills through scenario-based questions."]
@@ -373,9 +542,10 @@ def analyze_resume(resume_text: str, job_description: str) -> dict:
 
     recommendation_rationale = (
         f"Overall score of {overall_score}/100 is derived from a {skills_match}% skill-keyword "
-        f"overlap, an estimated experience match of {experience_match}%, an education-keyword "
-        f"match of {education_match}%, and a certification match of {certifications_match}%. "
-        f"This is a rule-based estimate, not an AI judgment — use it as a first-pass filter."
+        f"overlap (must-have skills weighted higher than nice-to-have), an estimated experience "
+        f"match of {experience_match}%, an education-keyword match of {education_match}%, and a "
+        f"certification match of {certifications_match}%. This is a rule-based estimate, not an "
+        f"AI judgment — use it as a first-pass filter."
     )
 
     return {

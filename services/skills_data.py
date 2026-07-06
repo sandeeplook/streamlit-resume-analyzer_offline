@@ -75,7 +75,90 @@ DEGREE_KEYWORDS = [
     "Associate Degree", "Diploma", "Postgraduate Diploma", "PGDM",
 ]
 
-# Words to ignore when extracting "significant" keywords from a job description.
+# Aliases/abbreviations that should count as their canonical skill when found
+# as a standalone word (e.g. "ML" in a resume should count as "Machine Learning").
+# Keys are lowercase; only reasonably unambiguous short-forms are included.
+SKILL_SYNONYMS = {
+    "ml": "Machine Learning",
+    "dl": "Deep Learning",
+    "ai": "Machine Learning",
+    "js": "JavaScript",
+    "ts": "TypeScript",
+    "k8s": "Kubernetes",
+    "nlp": "Natural Language Processing",
+    "cv": "Computer Vision",
+    "reactjs": "React",
+    "react.js": "React",
+    "vuejs": "Vue",
+    "vue.js": "Vue",
+    "nodejs": "Node.js",
+    "node": "Node.js",
+    "postgres": "PostgreSQL",
+    "postgresql": "PostgreSQL",
+    "html5": "HTML",
+    "css3": "CSS",
+    "gcp": "Google Cloud",
+    "google cloud platform": "Google Cloud",
+    "amazon web services": "AWS",
+    "qa": "Quality Assurance",
+    "ui/ux": "UI/UX Design",
+    "ux/ui": "UI/UX Design",
+    "ux design": "UI/UX Design",
+    "ui design": "UI/UX Design",
+    "crm": "Customer Relationship Management",
+    "ci/cd": "CI/CD",
+    "cicd": "CI/CD",
+    "rest apis": "REST API",
+    "restful api": "REST API",
+    "restful apis": "REST API",
+    "sre": "Site Reliability Engineering",
+    "pm": "Project Management",
+    "product mgmt": "Product Management",
+    "sql server": "SQL",
+    "mysql": "MySQL",
+    "mssql": "SQL",
+    "seo/sem": "SEO",
+    "oop": "Object-Oriented Programming",
+}
+
+# Common resume section header phrases, grouped by canonical section. Matching
+# is done against a stripped, lowercased, punctuation-light version of a line.
+SECTION_HEADERS = {
+    "skills": [
+        "skills", "technical skills", "core skills", "key skills",
+        "core competencies", "areas of expertise", "competencies",
+        "technical proficiencies", "skill set",
+    ],
+    "experience": [
+        "experience", "work experience", "professional experience",
+        "employment history", "work history", "career history",
+        "relevant experience", "professional background",
+    ],
+    "education": [
+        "education", "academic background", "academic qualifications",
+        "educational qualifications", "academic history",
+    ],
+    "certifications": [
+        "certifications", "certificates", "licenses", "licenses and certifications",
+        "professional certifications", "certifications and licenses",
+    ],
+    "summary": [
+        "summary", "objective", "professional summary", "profile",
+        "career summary", "career objective", "about me",
+    ],
+    "projects": ["projects", "personal projects", "key projects"],
+}
+
+# Job-description section headers used to separate mandatory vs optional asks.
+JD_MUST_HAVE_HEADERS = [
+    "requirements", "required qualifications", "must have", "must-have",
+    "minimum qualifications", "basic qualifications", "what you'll need",
+    "what you need", "qualifications",
+]
+JD_NICE_TO_HAVE_HEADERS = [
+    "nice to have", "nice-to-have", "preferred qualifications", "preferred",
+    "bonus points", "bonus", "good to have", "pluses", "a plus",
+]
 STOPWORDS = {
     "a", "an", "the", "and", "or", "but", "if", "then", "so", "of", "to", "in",
     "on", "at", "for", "with", "by", "from", "up", "about", "into", "over",
